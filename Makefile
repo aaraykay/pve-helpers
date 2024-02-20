@@ -22,8 +22,8 @@ $(PACKAGE_FILE):
 		--category admin \
 		--url https://gitlab.com/ayufan/pve-helpers-build \
 		--description "Proxmox VE Helpers" \
-		--vendor "Kamil Trzciński" \
-		--maintainer "Kamil Trzciński <ayufan@ayufan.eu>" \
+		--vendor "Aaron Kincaid" \
+		--maintainer "Aaron Kincaid <aaraykay@gmail.com>" \
 		--license "MIT" \
 		--deb-priority optional \
 		--depends inotify-tools \
