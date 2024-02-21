@@ -141,14 +141,9 @@ exec_pin_vcpus_poststart() {
   echo "[$TITLE]: migrating vm '$VMID' to scope '$vmScope'..."
   echo $(get_vmpid) > "$vmScope/cgroup.procs"
 
-  IFS=', ' read -a ranges <<< "$cpuList"
-  for range in "${ranges[@]}"; do
-    IFS=- read start end <<< "$range"
-    [ -z "$start" ] && continue
-    [ -z "$end" ] && end=$start
-    for (( i=start ; i <= end ; i++ )); do
-      pin_vcpu $((vCpuNum++)) "$i"
-    done
+  IFS=', ' read -r -a cpus <<< "$cpuList"
+  for cpu in ${cpus[@]}; do
+    pin_vcpu $((vcpu++)) $cpu
   done
 }
 
@@ -156,7 +151,12 @@ exec_pin_tasks() {
   sleep_once
 
   local cpuList="$1"
+
   local tasks=$(grep -v -P "^CPU \d" /proc/$(get_vmpid)/task/*/comm | cut -d '/' -f5)
+  if [[ -z $tasks ]]; then
+    echo "[$TITLE]: failed to get guest vcpu tasks."
+    return 1
+  fi
 
   while IFS= read -r tpid; do
     pin_tpid $tpid $cpuList
