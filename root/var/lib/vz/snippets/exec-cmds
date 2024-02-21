@@ -3,9 +3,19 @@
 VMID="$1"
 ACTION="$2"
 SLEPT=""
+TITLE=$(basename "$0")
+VCPU_CGROUP="qemu-vcpus.slice"
 
-vmpid() {
+get_vmpid() {
   cat "/var/run/qemu-server/$VMID.pid"
+}
+
+get_hostpci_ids() {
+  grep '^hostpci[0-9]:.*0000' "/etc/pve/qemu-server/$VMID.conf" | awk '{print $2}' | awk -F, '{print $1}'
+}
+
+get_last_cpu() {
+  echo $(( $(nproc --all) - 1 ))
 }
 
 if_action() {
@@ -22,45 +32,51 @@ sleep_once() {
   fi
 }
 
-hostpci_ids() {
-  grep '^hostpci[0-9]:.*0000' "/etc/pve/qemu-server/$VMID.conf" | awk '{print $2}' | awk -F, '{print $1}'
+create_cgroup() {
+  local unitName="$1"
+
+  if [[ -d "/sys/fs/cgroup/$unitName" ]]; then
+    echo "[$TITLE]: cgroup '$unitName' already exists."
+    return 0
+  fi
+
+  echo "[$TITLE]: creating cgroup '$unitName'..."
+  mkdir /sys/fs/cgroup/$unitName
+}
+
+pin_cgroup() {
+  local groupName="$1"
+  local cpuList="$2"
+
+  echo "[$TITLE]: pinning cgroup '$groupName' to host cpu(s) '$cpuList'..."
+  systemctl set-property --runtime -- "$groupName" "AllowedCPUs=$cpuList"
+}
+
+pin_tpid() {
+  local tpid=$1
+  local cpuList="$2"
+
+  local taskComm=$(cat /proc/$(get_vmpid)/task/$tpid/comm)
+  echo "[$TITLE]: pinning guest task '$taskComm' to host cpu(s) '$cpuList'..."
+  taskset --cpu-list --pid "$cpuList" $tpid
+}
+
+pin_vcpu() {
+  local vcpu=$1
+  local cpuList="$2"
+
+  local tpid=$(grep "^CPU $vcpu/KVM\$" /proc/$(get_vmpid)/task/*/comm | cut -d '/' -f5)
+  if [[ -z $tpid ]]; then
+    echo "[$TITLE]: failed to get pid of guest task for vcpu '$vcpu'."
+    return 1
+  fi
+
+  pin_tpid $tpid $cpuList
 }
 
 exec_pci_rescan() {
-  echo "Running PCI rescan for $VMID..."
+  echo "[$TITLE]: rescanning for pci devices..."
   echo 1 > /sys/bus/pci/rescan
-}
-
-exec_set_haltpoll() {
-  echo "Setting haltpoll for $VMID..."
-  echo $1 > /sys/module/kvm/parameters/halt_poll_ns
-}
-
-exec_assign_interrupts() {
-  local SLEEP="30s"
-  if [[ $1 == --sleep=* ]]; then
-    SLEEP="${1#--sleep=}"
-    shift
-  fi
-
-  echo "Wating $SLEEP seconds for all vfio-gpu interrupts to show up..."
-  sleep "$SLEEP"
-
-  MASK="$1"
-  shift
-
-  if [[ "$1" == "--all" ]]; then
-    set -- $(hostpci_ids)
-  fi
-
-  for interrupt; do
-    interrupt=$(printf '%b' "${interrupt//%/\\x}")
-    echo "Moving $interrupt interrupts to $MASK cpu cores $VMID..."
-    grep "$interrupt" /proc/interrupts | cut -d ":" -f 1 | while read -r i; do
-      echo "- IRQ: $(grep "^\s*$i:" /proc/interrupts)"
-      echo "$MASK" > /proc/irq/$i/smp_affinity_list
-    done
-  done
 }
 
 exec_pci_unbind() {
@@ -72,95 +88,164 @@ exec_pci_unbind() {
 
   for devid; do
     if [[ -e "/sys/bus/pci/devices/$devid" ]]; then
-      echo "Running PCI unbind of '$devid' for $VMID..."
+      echo "[$TITLE]: unbinding pci device '$devid'..."
       echo 1 > "/sys/bus/pci/devices/$devid/remove"
     elif [[ -e "/sys/bus/pci/devices/$devid.0" ]]; then
-      echo "Running PCI unbind of '$devid.0' for $VMID..."
+      echo "[$TITLE]: unbinding pci device '$devid.0'..."
       echo 1 > "/sys/bus/pci/devices/$devid.0/remove"
     else
-      echo "The '$devid' not found in '/sys/bus/pci/devices'"
+      echo "[$TITLE]: device '$devid' not found in '/sys/bus/pci/devices'"
     fi
   done
 }
 
-exec_cpu_taskset() {
-  sleep_once
-
-  echo "Running taskset with $1 for $(vmpid)..."
-  taskset -a -p -c "$1" "$(vmpid)"
-  echo ""
+exec_set_haltpoll() {
+  echo "[$TITLE]: setting haltpoll to '$1'..."
+  echo $1 > /sys/module/kvm/parameters/halt_poll_ns
 }
 
 exec_cpu_chrt() {
   sleep_once
 
-  echo "Running chrt with $1:$2 for $(vmpid)..."
-  chrt -v "--$1" -a -p "$2" "$(vmpid)"
+  echo "[$TITLE]: running chrt with '$1:$2' for '$(get_vmpid)'..."
+  chrt -v "--$1" -a -p "$2" "$(get_vmpid)"
   echo ""
 }
 
 exec_qm_conflict() {
-  echo "Conflicting with other VM$1, shutdown just in case..."
+  echo "[$TITLE]: conflicting with other vm '$1', shutdown just in case..."
   qm shutdown "$1"
 }
 
 exec_qm_depends() {
-  echo "VM$1 is required, ensure that it is started..."
+  echo "[$TITLE]: vm '$1' is required, ensure that it is started..."
   qm start "$1"
+}
+
+exec_pin_vcpus_prestart() {
+  create_cgroup "$VCPU_CGROUP"
+  pin_cgroup "$VCPU_CGROUP" "0-$(get_last_cpu)"
+}
+
+exec_pin_vcpus_poststart() {
+  sleep_once
+
+  local cpuList="$1"
+  
+  local vmScope="/sys/fs/cgroup/$VCPU_CGROUP/$VMID.scope"
+  if [[ ! -d "$vmScope" ]]; then
+    echo "[$TITLE]: creating scope '$vmScope'..."
+    mkdir "$vmScope"
+  fi
+
+  echo "[$TITLE]: migrating vm '$VMID' to scope '$vmScope'..."
+  echo $(get_vmpid) > "$vmScope/cgroup.procs"
+
+  IFS=', ' read -a ranges <<< "$cpuList"
+  for range in "${ranges[@]}"; do
+    IFS=- read start end <<< "$range"
+    [ -z "$start" ] && continue
+    [ -z "$end" ] && end=$start
+    for (( i=start ; i <= end ; i++ )); do
+      pin_vcpu $((vCpuNum++)) "$i"
+    done
+  done
+}
+
+exec_pin_tasks() {
+  sleep_once
+
+  local cpuList="$1"
+  local tasks=$(grep -v -P "^CPU \d" /proc/$(get_vmpid)/task/*/comm | cut -d '/' -f5)
+
+  while IFS= read -r tpid; do
+    pin_tpid $tpid $cpuList
+  done <<< "$tasks"
+}
+
+exec_pin_irqs() {
+  local SLEEP="30s"
+  if [[ $1 == --sleep=* ]]; then
+    SLEEP="${1#--sleep=}"
+    shift
+  fi
+
+  echo "[$TITLE]: waiting $SLEEP seconds for guest passthrough device interrupts..."
+  sleep "$SLEEP"
+
+  cpuList="$1"
+  shift
+
+  if [[ "$1" == "--all" ]]; then
+    set -- $(get_hostpci_ids)
+  fi
+
+  for interrupt; do
+    interrupt=$(printf '%b' "${interrupt//%/\\x}")
+    echo "[$TITLE]: pinning guest passthrough device interrupt '$interrupt' to host cpus '$cpuList'..."
+    grep "$interrupt" /proc/interrupts | cut -d ":" -f 1 | while read -r i; do
+      echo "- IRQ: $(grep "^\s*$i:" /proc/interrupts)"
+      echo "$cpuList" > /proc/irq/$i/smp_affinity_list
+    done
+  done
 }
 
 exec_cmds() {
   while read CMD ARG1 ARG2 ARG3 REST; do
     case "$CMD" in
-      "#pci_rescan")
+      "#ph_pci_rescan")
         if_action pre-start exec_pci_rescan
         ;;
 
-      "#cpu_taskset")
-        if_action post-start exec_cpu_taskset "$ARG1"
-        ;;
-
-      "#set_halt_poll")
-        if_action post-start exec_set_haltpoll "$ARG1"
-        ;;
-
-      "#assign_interrupts")
-        if_action post-start exec_assign_interrupts "$ARG1" "$ARG2" "$ARG3" $REST
-        ;;
-
-      "#cpu_chrt")
-        if_action post-start exec_cpu_chrt "${ARG1:-fifo}" "${ARG2:-1}"
-        ;;
-
-      "#qm_depends")
-        if_action post-start exec_qm_depends "$ARG1"
-        ;;
-
-      "#pci_unbind")
+      "#ph_pci_unbind")
         if_action post-stop exec_pci_unbind "$ARG1" "$ARG2" "$ARG3"
         ;;
 
-      "#pci_unbind_all")
+      "#ph_pci_unbind_all")
         if_action post-stop exec_pci_unbind_all
         ;;
 
-      "#pci_rebind")
+      "#ph_pci_rebind")
         if_action post-stop exec_pci_rescan
         ;;
 
-      "#qm_conflict")
+      "#ph_set_haltpoll")
+        if_action post-start exec_set_haltpoll "$ARG1"
+        ;;
+
+      "#ph_cpu_chrt")
+        if_action post-start exec_cpu_chrt "${ARG1:-fifo}" "${ARG2:-1}"
+        ;;
+
+      "#ph_qm_conflict")
         if_action pre-start exec_qm_conflict "$ARG1"
         ;;
 
-      "#qm_*"|"#cpu_*"|"#pci_*"|"#set_*"|"#assign_*")
+      "#ph_qm_depends")
+        if_action post-start exec_qm_depends "$ARG1"
+        ;;
+
+      "#ph_pin_vcpus")
+        if_action pre-start exec_pin_vcpus_prestart "$ARG1"
+        if_action post-start exec_pin_vcpus_poststart "$ARG1"
+        ;;
+
+      "#ph_pin_tasks")
+        if_action post-start exec_pin_tasks "$ARG1"
+        ;;
+
+      "#ph_pin_irqs")
+        if_action post-start exec_pin_irqs "$ARG1" "$ARG2" "$ARG3" $REST
+        ;;
+
+      "#ph_*")
         echo "exec-cmds: command is unknown '$CMD'"
         ;;
     esac
   done
 }
 
-echo "Running exec-cmds for $VMID on $ACTION..."
-
+echo "[$TITLE]: running '$ACTION' for vm '$VMID'..."
 exec_cmds < "/etc/pve/qemu-server/$VMID.conf"
 
 exit 0
