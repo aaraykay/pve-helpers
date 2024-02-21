@@ -20,7 +20,7 @@ $(PACKAGE_FILE):
 		--package $@ \
 		--architecture all \
 		--category admin \
-		--url https://gitlab.com/ayufan/pve-helpers-build \
+		--url https://gitlab.com/aaraykay/pve-helpers-build \
 		--description "Proxmox VE Helpers" \
 		--vendor "Aaron Kincaid" \
 		--maintainer "Aaron Kincaid <aaraykay@gmail.com>" \
