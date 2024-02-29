@@ -53,7 +53,7 @@ Edit VM description and add a new line if one or both these two commands.
 For the best performance you want to assign VM to physical cores,
 not a mix of physical and virtual cores.
 
-For example for `i7-8700` each core has two threads: 0-6, 1-7, 2-8.
+For example for `i7-8700` each core has two threads: 0+6, 1+7, 2+8.
 You can easily check that with `lscpu -e`, checking which cores are
 assigned twice.
 
@@ -73,17 +73,16 @@ CPU NODE SOCKET CORE L1d:L1i:L2:L3 ONLINE MAXMHZ    MINMHZ
 11  0    0      5    5:5:5:0       yes    4600.0000 800.0000
 ```
 
-For example it is advised to assign one CPU less than a number of
+For example it is advised to assign one CPU less than the number of
 physical cores. For the `i7-8700` it will be 5 cores.
 
-Then, you can assign the 5 cores (with CPU pinning, but not pinning specific
-threads) to VM:
+For example we can pin each vCPU task for our first VM to its own non-physical thread:
 
 ```text
-ph_pin_vcpus 7-11
+ph_pin_vcpus 7,8,9,10,11
 ```
 
-This does assign to VM second thread of physical cores 1-6. We deliberatly
+Now for our second VM, we can pin each vCPU task to its own physical core. We deliberatly
 choose to not assign `CORE 0`.
 
 If you have two VMs concurrently running, you can assign it on one thread,
@@ -91,10 +90,10 @@ second on another thread, like this:
 
 ```text
 VM 1:
-ph_pin_vcpus 1-5
+ph_pin_vcpus 1,2,3,4,5
 
 VM 2:
-ph_pin_vcpus 7-11
+ph_pin_vcpus 7,8,9,10,11
 ```
 
 ### 2.2. use `vendor-reset` for fixing AMD Radeon reset bug
